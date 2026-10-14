@@ -1,0 +1,551 @@
+name: Ephemeral Tailscale VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_repo:
+        description: "Private persistence repo (owner/repo, e.g. myuser/vps-state)"
+        required: true
+        type: string
+      private_branch:
+        description: "Branch in private repo to load/save state"
+        required: false
+        default: "main"
+        type: string
+      session_minutes:
+        description: "Max session duration in minutes (keep <= 345 to leave buffer before GitHub's 360m hard kill)"
+        required: false
+        default: "340"
+        type: string
+      sync_interval_minutes:
+        description: "Background auto-sync interval in minutes (0 to disable periodic sync)"
+        required: false
+        default: "10"
+        type: string
+      run_bootstrap:
+        description: "Execute bootstrap.sh from the private repo on startup"
+        required: false
+        default: true
+        type: boolean
+      hostname:
+        description: "Tailscale hostname for this runner"
+        required: false
+        default: "gha-ai-vps"
+        type: string
+
+# Least-privilege default GITHUB_TOKEN permissions for the public repo itself.
+# Pushing to the private state repo uses secrets.PRIVATE_REPO_TOKEN exclusively.
+permissions:
+  contents: read
+
+concurrency:
+  group: ephemeral-tailscale-vps-${{ inputs.private_repo }}-${{ inputs.private_branch }}
+  cancel-in-progress: false
+
+jobs:
+  vps:
+    name: Ephemeral AI Agent VPS
+    runs-on: ubuntu-latest
+    # GitHub-hosted runners have a hard 360-minute limit.
+    # Setting timeout-minutes to 355 ensures post/always cleanup steps execute reliably.
+    timeout-minutes: 355
+
+    steps:
+      - name: Verify Trigger Authorization
+        run: |
+          if [ "${{ github.actor }}" != "${{ github.repository_owner }}" ]; then
+            echo "::error::Unauthorized actor (${{ github.actor }}). Only the repository owner may launch this VPS."
+            exit 1
+          fi
+
+      - name: Configure System & Hardened OpenSSH Server
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SSH_KEY}" ]; then
+            echo "::error::Secret SSH_KEY is empty or not set."
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            openssh-server rsync jq tmux ripgrep fd-find fzf tree htop curl wget unzip git-lfs
+
+          # Configure ~/.ssh/authorized_keys for the runner user
+          mkdir -p /home/runner/.ssh
+          chmod 700 /home/runner/.ssh
+          printf '%s\n' "${SSH_KEY}" > /home/runner/.ssh/authorized_keys
+          chmod 600 /home/runner/.ssh/authorized_keys
+          chown -R runner:runner /home/runner/.ssh
+
+          # Allow runner passwordless sudo
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-runner-nopasswd >/dev/null
+          sudo chmod 440 /etc/sudoers.d/99-runner-nopasswd
+
+          # Harden sshd: key-only auth, no root login, keepalive enabled
+          sudo mkdir -p /run/sshd
+          sudo tee /etc/ssh/sshd_config.d/99-vps-hardening.conf >/dev/null <<'EOF'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          AllowUsers runner
+          ClientAliveInterval 30
+          ClientAliveCountMax 6
+          AcceptEnv LANG LC_*
+          EOF
+
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+      - name: Connect to Tailscale Network
+        env:
+          TAILSCALEKEY: ${{ secrets.TAILSCALEKEY }}
+          TS_HOSTNAME: ${{ inputs.hostname }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAILSCALEKEY}" ]; then
+            echo "::error::Secret TAILSCALEKEY is empty or not set."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+          sudo tailscale up \
+            --authkey="${TAILSCALEKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-routes
+
+          for i in $(seq 1 30); do
+            TS_IP=$(tailscale ip -4 2>/dev/null || true)
+            if [ -n "${TS_IP}" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "${TS_IP:-}" ]; then
+            echo "::error::Failed to obtain Tailscale IPv4 address."
+            exit 1
+          fi
+
+          TS_DNS=$(tailscale status --json | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+
+          # Restrict SSH port 22 strictly to the tailscale0 interface
+          sudo ufw default allow outgoing
+          sudo ufw allow in on tailscale0 to any port 22 proto tcp
+          sudo ufw deny in to any port 22 proto tcp
+          sudo ufw --force enable
+
+          {
+            echo "### Tailscale VPS Ready"
+            echo ""
+            echo "- **Tailscale IPv4:** \`${TS_IP}\`"
+            if [ -n "${TS_DNS}" ]; then
+              echo "- **MagicDNS Host:** \`${TS_DNS}\`"
+            fi
+            echo "- **SSH Command:** \`ssh runner@${TS_IP}\`"
+            if [ -n "${TS_DNS}" ]; then
+              echo "- **SSH via MagicDNS:** \`ssh runner@${TS_DNS}\`"
+            fi
+            echo "- **Manual Save Command (inside SSH):** \`vps-sync\`"
+            echo "- **Graceful Shutdown Command (inside SSH):** \`vps-stop\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=========================================="
+          echo "VPS is online over Tailscale!"
+          echo "SSH Command: ssh runner@${TS_IP}"
+          [ -n "${TS_DNS}" ] && echo "MagicDNS:    ssh runner@${TS_DNS}"
+          echo "=========================================="
+
+      - name: Initialize Isolated Private State Sync Engine & Restore State
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIVATE_REPO: ${{ inputs.private_repo }}
+          PRIVATE_BRANCH: ${{ inputs.private_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PRIVATE_REPO_TOKEN}" ]; then
+            echo "::error::Secret PRIVATE_REPO_TOKEN is empty or not set."
+            exit 1
+          fi
+
+          # Store Git credentials in a root-only directory outside /home/runner
+          # so AI coding agents scanning user files cannot accidentally read or leak the token.
+          sudo mkdir -p /etc/vps-sync /var/lib/vps-state
+          sudo chown root:root /etc/vps-sync /var/lib/vps-state
+          sudo chmod 700 /etc/vps-sync /var/lib/vps-state
+
+          sudo tee /etc/vps-sync/git-askpass.sh >/dev/null <<EOF
+          #!/usr/bin/env bash
+          case "\$1" in
+            *Username*) echo "x-access-token" ;;
+            *Password*) echo "${PRIVATE_REPO_TOKEN}" ;;
+          esac
+          EOF
+          sudo chown root:root /etc/vps-sync/git-askpass.sh
+          sudo chmod 700 /etc/vps-sync/git-askpass.sh
+
+          sudo tee /etc/vps-sync/config.env >/dev/null <<EOF
+          PRIVATE_REPO="${PRIVATE_REPO}"
+          PRIVATE_BRANCH="${PRIVATE_BRANCH}"
+          STATE_DIR="/var/lib/vps-state"
+          RUNNER_HOME="/home/runner"
+          EOF
+          sudo chown root:root /etc/vps-sync/config.env
+          sudo chmod 600 /etc/vps-sync/config.env
+
+          # Install the vps-sync and vps-stop utilities globally
+          sudo tee /usr/local/bin/vps-sync >/dev/null <<'SYNC_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [ "$(id -u)" -ne 0 ]; then
+            exec sudo "$0" "$@"
+          fi
+
+          source /etc/vps-sync/config.env
+          export GIT_ASKPASS="/etc/vps-sync/git-askpass.sh"
+          export GIT_TERMINAL_PROMPT=0
+
+          MODE="${1:-push}"
+          LOCK_FILE="/tmp/vps-sync.lock"
+
+          exec 9>"${LOCK_FILE}"
+          if ! flock -w 60 9; then
+            echo "[vps-sync] Another sync is currently in progress. Skipping."
+            exit 0
+          fi
+
+          ensure_defaults() {
+            if [ ! -f "${RUNNER_HOME}/.config/vps-sync/sync-paths.conf" ]; then
+              mkdir -p "${RUNNER_HOME}/.config/vps-sync"
+              cat > "${RUNNER_HOME}/.config/vps-sync/sync-paths.conf" <<'EOF'
+          # Directories & files inside /home/runner to persist to the private repo.
+          workspaces
+          scripts
+          prompts
+          skills
+          custom
+          bootstrap.sh
+          # AI coding agent configs & state
+          .config/vps-sync
+          .config/opencode
+          .local/share/opencode
+          .opencode
+          .config/kilocode
+          .kilocode
+          .config/antigravity
+          .antigravity
+          .claude
+          .claude.json
+          .codex
+          .gemini
+          .aider.conf.yml
+          .config/gh
+          # Shell & editor dotfiles
+          .bashrc
+          .bash_aliases
+          .profile
+          .zshrc
+          .gitconfig
+          .tmux.conf
+          .vimrc
+          .config/nvim
+          .config/starship.toml
+          EOF
+            fi
+
+            if [ ! -f "${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf" ]; then
+              mkdir -p "${RUNNER_HOME}/.config/vps-sync"
+              cat > "${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf" <<'EOF'
+          # Excluded patterns (never persisted to the private repo)
+          node_modules/
+          .pnpm-store/
+          .npm/
+          .npm-global/
+          .bun/
+          .yarn/
+          .venv/
+          venv/
+          __pycache__/
+          *.py[cod]
+          .pytest_cache/
+          .mypy_cache/
+          .ruff_cache/
+          .uv/
+          .cargo/
+          .rustup/
+          target/
+          dist/
+          build/
+          out/
+          .next/
+          .nuxt/
+          .svelte-kit/
+          .turbo/
+          .parcel-cache/
+          .cache/
+          *.log
+          *.tmp
+          *.swp
+          .DS_Store
+          EOF
+            fi
+
+            if [ ! -f "${RUNNER_HOME}/bootstrap.sh" ]; then
+              cat > "${RUNNER_HOME}/bootstrap.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "[bootstrap] Reinstalling ephemeral runtime tools & AI coding agents..."
+
+          mkdir -p "$HOME/.local/bin" "$HOME/.npm-global/bin"
+          export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+          npm config set prefix "$HOME/.npm-global"
+
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          fi
+
+          if ! command -v bun >/dev/null 2>&1; then
+            curl -fsSL https://bun.sh/install | bash
+          fi
+
+          if ! command -v opencode >/dev/null 2>&1; then
+            npm install -g opencode-ai || true
+          fi
+
+          if ! command -v kilocode >/dev/null 2>&1; then
+            npm install -g @kilocode/cli || true
+          fi
+
+          # Uncomment or customize for Antigravity CLI or other tools:
+          # if ! command -v antigravity >/dev/null 2>&1; then
+          #   npm install -g antigravity-cli || true
+          # fi
+
+          echo "[bootstrap] Done!"
+          EOF
+              chmod +x "${RUNNER_HOME}/bootstrap.sh"
+            fi
+          }
+
+          if [ "${MODE}" = "restore" ]; then
+            echo "[vps-sync] Cloning private persistence repo (${PRIVATE_REPO}, branch: ${PRIVATE_BRANCH})..."
+            rm -rf "${STATE_DIR}"
+            mkdir -p "${STATE_DIR}"
+
+            if git clone --depth 1 --branch "${PRIVATE_BRANCH}" "https://github.com/${PRIVATE_REPO}.git" "${STATE_DIR}" 2>/dev/null; then
+              echo "[vps-sync] Existing branch '${PRIVATE_BRANCH}' found. Restoring files..."
+            else
+              echo "[vps-sync] Branch '${PRIVATE_BRANCH}' not found or repo is empty. Initializing new state branch..."
+              git clone "https://github.com/${PRIVATE_REPO}.git" "${STATE_DIR}"
+              cd "${STATE_DIR}"
+              git checkout -B "${PRIVATE_BRANCH}"
+            fi
+
+            cd "${STATE_DIR}"
+            git config user.name "gha-vps-sync[bot]"
+            git config user.email "gha-vps-sync[bot]@users.noreply.github.com"
+
+            mkdir -p \
+              "${RUNNER_HOME}/workspaces" \
+              "${RUNNER_HOME}/scripts" \
+              "${RUNNER_HOME}/prompts" \
+              "${RUNNER_HOME}/skills" \
+              "${RUNNER_HOME}/custom" \
+              "${RUNNER_HOME}/.config"
+
+            if [ -d "${STATE_DIR}/home" ]; then
+              rsync -a "${STATE_DIR}/home/" "${RUNNER_HOME}/"
+
+              # Restore any nested git repositories that were archived as .git.vps-backup
+              while IFS= read -r -d '' backup_git; do
+                target_git="${backup_git%.vps-backup}"
+                rm -rf "${target_git}"
+                mv "${backup_git}" "${target_git}"
+              done < <(find "${RUNNER_HOME}" -depth -name ".git.vps-backup" -print0)
+
+              find "${RUNNER_HOME}" -depth -name ".git.vps-backup" -exec rm -rf {} +
+            fi
+
+            ensure_defaults
+            chown -R runner:runner "${RUNNER_HOME}"
+            echo "[vps-sync] Restore complete."
+            exit 0
+          fi
+
+          # Default mode: push changes from /home/runner to private repo
+          ensure_defaults
+
+          mkdir -p "${STATE_DIR}/home"
+          EXCLUDE_FILE="${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf"
+          PATHS_FILE="${RUNNER_HOME}/.config/vps-sync/sync-paths.conf"
+
+          rm -rf "${STATE_DIR}/home.staging"
+          mkdir -p "${STATE_DIR}/home.staging"
+
+          while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+            rel_path=$(echo "${raw_line}" | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+            rel_path="${rel_path%/}"
+            [ -z "${rel_path}" ] && continue
+
+            case "${rel_path}" in
+              /*|*..*|".git"|".ssh")
+                echo "[vps-sync] Skipping unsafe or reserved path: ${rel_path}"
+                continue
+                ;;
+            esac
+
+            src_path="${RUNNER_HOME}/${rel_path}"
+            if [ -e "${src_path}" ]; then
+              mkdir -p "$(dirname "${STATE_DIR}/home.staging/${rel_path}")"
+              # Exclude files > 50MB so GitHub's 100MB push limit never blocks a state save
+              rsync -a --delete \
+                --max-size=50m \
+                --exclude-from="${EXCLUDE_FILE}" \
+                "${src_path}" "$(dirname "${STATE_DIR}/home.staging/${rel_path}")/"
+            fi
+          done < "${PATHS_FILE}"
+
+          rm -rf "${STATE_DIR}/home"
+          mv "${STATE_DIR}/home.staging" "${STATE_DIR}/home"
+
+          # Convert nested .git directories inside staged workspaces into .git.vps-backup
+          while IFS= read -r -d '' nested_git; do
+            mv "${nested_git}" "${nested_git}.vps-backup"
+          done < <(find "${STATE_DIR}/home" -depth -name ".git" -print0)
+
+          cat > "${STATE_DIR}/README.md" <<EOF
+          # Ephemeral VPS State Repository
+
+          Automatically synced by GitHub Actions Ephemeral VPS workflow.
+          - **Last Sync (UTC):** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Synced Paths Config:** \`home/.config/vps-sync/sync-paths.conf\`
+          - **Excluded Patterns Config:** \`home/.config/vps-sync/sync-exclude.conf\`
+          - **Bootstrap Script:** \`home/bootstrap.sh\`
+          EOF
+
+          cd "${STATE_DIR}"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "[vps-sync] No state changes detected at $(date -u +"%H:%M:%S UTC")."
+            exit 0
+          fi
+
+          COMMIT_MSG="sync: $(date -u +"%Y-%m-%d %H:%M:%S UTC") (${MODE})"
+          git commit -m "${COMMIT_MSG}"
+
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${PRIVATE_BRANCH}"; then
+              echo "[vps-sync] Successfully synced state to ${PRIVATE_REPO}@${PRIVATE_BRANCH}."
+              exit 0
+            fi
+            echo "[vps-sync] Push attempt ${attempt} failed, pulling --rebase and retrying..."
+            git pull --rebase origin "${PRIVATE_BRANCH}" || true
+            sleep 2
+          done
+
+          echo "::error::[vps-sync] Failed to push state after 3 attempts."
+          exit 1
+          SYNC_SCRIPT
+          sudo chmod 755 /usr/local/bin/vps-sync
+
+          sudo tee /usr/local/bin/vps-stop >/dev/null <<'STOP_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "[vps-stop] Running immediate state sync before shutting down..."
+          /usr/local/bin/vps-sync "manual-stop"
+          touch /tmp/vps-stop-signal
+          echo "[vps-stop] Shutdown signal sent. Runner will terminate in a few seconds."
+          STOP_SCRIPT
+          sudo chmod 755 /usr/local/bin/vps-stop
+
+          sudo tee /etc/profile.d/99-vps-paths.sh >/dev/null <<'EOF'
+          export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+          EOF
+          sudo chmod 644 /etc/profile.d/99-vps-paths.sh
+
+          if ! grep -q "99-vps-paths.sh" /home/runner/.bashrc 2>/dev/null; then
+            echo '[ -f /etc/profile.d/99-vps-paths.sh ] && source /etc/profile.d/99-vps-paths.sh' >> /home/runner/.bashrc
+          fi
+
+          /usr/local/bin/vps-sync restore
+
+      - name: Run Bootstrap Script (Reinstall Ephemeral Packages & AI CLI Tools)
+        if: ${{ inputs.run_bootstrap }}
+        run: |
+          set -euo pipefail
+          if [ -f /home/runner/bootstrap.sh ]; then
+            chmod +x /home/runner/bootstrap.sh
+            echo "Running /home/runner/bootstrap.sh as runner..."
+            su - runner -c "/home/runner/bootstrap.sh"
+          else
+            echo "No /home/runner/bootstrap.sh found, skipping."
+          fi
+
+      - name: Run Interactive VPS Session & Periodic Auto-Sync Loop
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          SYNC_INTERVAL_MINUTES: ${{ inputs.sync_interval_minutes }}
+        run: |
+          set -euo pipefail
+
+          MAX_MINUTES="${SESSION_MINUTES}"
+          if [ "${MAX_MINUTES}" -gt 345 ]; then
+            echo "Clamping session_minutes from ${MAX_MINUTES} to 345 to guarantee safe final sync before 6h limit."
+            MAX_MINUTES=345
+          fi
+
+          END_TIME=$(( $(date +%s) + MAX_MINUTES * 60 ))
+          SYNC_INTERVAL_SEC=$(( SYNC_INTERVAL_MINUTES * 60 ))
+          LAST_SYNC=$(date +%s)
+
+          trap 'echo "Signal received! Exiting session loop to trigger final sync..."; exit 0' SIGTERM SIGINT
+
+          echo "VPS session active until $(date -u -d "@${END_TIME}" +"%Y-%m-%d %H:%M:%S UTC") (${MAX_MINUTES} minutes)."
+          echo "Run 'vps-sync' inside SSH to save immediately, or 'vps-stop' to save and shut down."
+
+          while [ "$(date +%s)" -lt "${END_TIME}" ]; do
+            if [ -f /tmp/vps-stop-signal ]; then
+              echo "Graceful stop signal (/tmp/vps-stop-signal) detected. Ending session..."
+              break
+            fi
+
+            NOW=$(date +%s)
+            if [ "${SYNC_INTERVAL_SEC}" -gt 0 ] && [ $(( NOW - LAST_SYNC )) -ge "${SYNC_INTERVAL_SEC}" ]; then
+              /usr/local/bin/vps-sync "periodic" || echo "::warning::Periodic sync encountered an error."
+              LAST_SYNC=$(date +%s)
+            fi
+
+            sleep 5 &
+            wait $! || true
+          done
+
+          echo "Session loop finished."
+
+      - name: Final On-Exit State Sync to Private Repository
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -x /usr/local/bin/vps-sync ] && [ -f /etc/vps-sync/config.env ]; then
+            echo "Performing final state sync to private repository..."
+            /usr/local/bin/vps-sync "final-exit"
+          else
+            echo "Sync engine was not initialized; skipping final sync."
+          fi
+
+      - name: Disconnect Tailscale Ephemeral Node & Shred Secrets
+        if: always()
+        run: |
+          sudo tailscale logout || true
+          sudo tailscale down || true
+          sudo rm -rf /etc/vps-sync
