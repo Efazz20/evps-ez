@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       private_repo:
-        description: "Private persistence repo (owner/repo, e.g. myuser/vps-state)"
+        description: "Private persistence repo (owner/repo or GitHub URL)"
         required: true
+        default: "Efazz20/evps-ez-rec"
         type: string
       private_branch:
         description: "Branch in private repo to load/save state"
@@ -80,7 +81,7 @@ jobs:
           chmod 600 /home/runner/.ssh/authorized_keys
           chown -R runner:runner /home/runner/.ssh
 
-          # Allow runner passwordless sudo
+          # Allow runner passwordless sudo (standard on GitHub runners, ensure it persists for SSH)
           echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-runner-nopasswd >/dev/null
           sudo chmod 440 /etc/sudoers.d/99-runner-nopasswd
 
@@ -113,14 +114,18 @@ jobs:
             exit 1
           fi
 
+          # Install official Tailscale package
           curl -fsSL https://tailscale.com/install.sh | sh
+
           sudo systemctl enable --now tailscaled
 
+          # Authenticate with Tailscale using the provided Auth Key
           sudo tailscale up \
             --authkey="${TAILSCALEKEY}" \
             --hostname="${TS_HOSTNAME}" \
             --accept-routes
 
+          # Wait for Tailscale IPv4 assignment
           for i in $(seq 1 30); do
             TS_IP=$(tailscale ip -4 2>/dev/null || true)
             if [ -n "${TS_IP}" ]; then
@@ -136,11 +141,14 @@ jobs:
 
           TS_DNS=$(tailscale status --json | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
 
-          # Restrict SSH port 22 strictly to the tailscale0 interface
+          # Restrict SSH to the tailscale0 interface using UFW for defense-in-depth
           sudo ufw default allow outgoing
           sudo ufw allow in on tailscale0 to any port 22 proto tcp
           sudo ufw deny in to any port 22 proto tcp
           sudo ufw --force enable
+
+          echo "TS_IP=${TS_IP}" >> "$GITHUB_ENV"
+          echo "TS_DNS=${TS_DNS}" >> "$GITHUB_ENV"
 
           {
             echo "### Tailscale VPS Ready"
@@ -175,6 +183,9 @@ jobs:
             echo "::error::Secret PRIVATE_REPO_TOKEN is empty or not set."
             exit 1
           fi
+
+          # Normalize PRIVATE_REPO in case a full URL (https://github.com/owner/repo) was entered
+          PRIVATE_REPO=$(echo "${PRIVATE_REPO}" | sed -E 's#^https?://github\.com/##; s#\.git$##; s#/$##')
 
           # Store Git credentials in a root-only directory outside /home/runner
           # so AI coding agents scanning user files cannot accidentally read or leak the token.
@@ -224,10 +235,12 @@ jobs:
           fi
 
           ensure_defaults() {
+            # Default sync-paths.conf (relative to /home/runner)
             if [ ! -f "${RUNNER_HOME}/.config/vps-sync/sync-paths.conf" ]; then
               mkdir -p "${RUNNER_HOME}/.config/vps-sync"
               cat > "${RUNNER_HOME}/.config/vps-sync/sync-paths.conf" <<'EOF'
           # Directories & files inside /home/runner to persist to the private repo.
+          # One relative path per line (comments start with #).
           workspaces
           scripts
           prompts
@@ -262,6 +275,7 @@ jobs:
           EOF
             fi
 
+            # Default sync-exclude.conf (transient caches, packages, build artifacts)
             if [ ! -f "${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf" ]; then
               mkdir -p "${RUNNER_HOME}/.config/vps-sync"
               cat > "${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf" <<'EOF'
@@ -299,6 +313,7 @@ jobs:
           EOF
             fi
 
+            # Default bootstrap.sh if not yet present
             if [ ! -f "${RUNNER_HOME}/bootstrap.sh" ]; then
               cat > "${RUNNER_HOME}/bootstrap.sh" <<'EOF'
           #!/usr/bin/env bash
@@ -306,27 +321,35 @@ jobs:
 
           echo "[bootstrap] Reinstalling ephemeral runtime tools & AI coding agents..."
 
+          # Ensure standard user-local bin paths exist
           mkdir -p "$HOME/.local/bin" "$HOME/.npm-global/bin"
           export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+
+          # Configure npm global prefix outside system root so `npm i -g` works without sudo
           npm config set prefix "$HOME/.npm-global"
 
+          # 1. Install uv (fast Python package & tool manager)
           if ! command -v uv >/dev/null 2>&1; then
             curl -LsSf https://astral.sh/uv/install.sh | sh
           fi
 
+          # 2. Install Bun (fast JS runtime & package manager)
           if ! command -v bun >/dev/null 2>&1; then
             curl -fsSL https://bun.sh/install | bash
           fi
 
+          # 3. Install AI Coding Agents (uncomment or customize as needed)
+          # OpenCode CLI
           if ! command -v opencode >/dev/null 2>&1; then
             npm install -g opencode-ai || true
           fi
 
+          # Kilo Code CLI
           if ! command -v kilocode >/dev/null 2>&1; then
             npm install -g @kilocode/cli || true
           fi
 
-          # Uncomment or customize for Antigravity CLI or other tools:
+          # Antigravity CLI (adjust package/install command if using a custom installer)
           # if ! command -v antigravity >/dev/null 2>&1; then
           #   npm install -g antigravity-cli || true
           # fi
@@ -355,6 +378,7 @@ jobs:
             git config user.name "gha-vps-sync[bot]"
             git config user.email "gha-vps-sync[bot]@users.noreply.github.com"
 
+            # Create standard workspace folders in /home/runner
             mkdir -p \
               "${RUNNER_HOME}/workspaces" \
               "${RUNNER_HOME}/scripts" \
@@ -364,6 +388,7 @@ jobs:
               "${RUNNER_HOME}/.config"
 
             if [ -d "${STATE_DIR}/home" ]; then
+              # Copy persisted state into /home/runner
               rsync -a "${STATE_DIR}/home/" "${RUNNER_HOME}/"
 
               # Restore any nested git repositories that were archived as .git.vps-backup
@@ -373,6 +398,7 @@ jobs:
                 mv "${backup_git}" "${target_git}"
               done < <(find "${RUNNER_HOME}" -depth -name ".git.vps-backup" -print0)
 
+              # Clean up any leftover .git.vps-backup in /home/runner
               find "${RUNNER_HOME}" -depth -name ".git.vps-backup" -exec rm -rf {} +
             fi
 
@@ -389,14 +415,17 @@ jobs:
           EXCLUDE_FILE="${RUNNER_HOME}/.config/vps-sync/sync-exclude.conf"
           PATHS_FILE="${RUNNER_HOME}/.config/vps-sync/sync-paths.conf"
 
+          # Build staging tree cleanly so deleted files inside tracked paths are also removed
           rm -rf "${STATE_DIR}/home.staging"
           mkdir -p "${STATE_DIR}/home.staging"
 
           while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+            # Strip comments, surrounding whitespace, and any trailing slash
             rel_path=$(echo "${raw_line}" | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
             rel_path="${rel_path%/}"
             [ -z "${rel_path}" ] && continue
 
+            # Prevent path traversal outside /home/runner
             case "${rel_path}" in
               /*|*..*|".git"|".ssh")
                 echo "[vps-sync] Skipping unsafe or reserved path: ${rel_path}"
@@ -419,10 +448,12 @@ jobs:
           mv "${STATE_DIR}/home.staging" "${STATE_DIR}/home"
 
           # Convert nested .git directories inside staged workspaces into .git.vps-backup
+          # so Git tracks all nested project files & local commits instead of ignoring them as submodules.
           while IFS= read -r -d '' nested_git; do
             mv "${nested_git}" "${nested_git}.vps-backup"
           done < <(find "${STATE_DIR}/home" -depth -name ".git" -print0)
 
+          # Write a clean README in the state repo root
           cat > "${STATE_DIR}/README.md" <<EOF
           # Ephemeral VPS State Repository
 
@@ -444,6 +475,7 @@ jobs:
           COMMIT_MSG="sync: $(date -u +"%Y-%m-%d %H:%M:%S UTC") (${MODE})"
           git commit -m "${COMMIT_MSG}"
 
+          # Push with retry + rebase in case of concurrent updates
           for attempt in 1 2 3; do
             if git push origin "HEAD:${PRIVATE_BRANCH}"; then
               echo "[vps-sync] Successfully synced state to ${PRIVATE_REPO}@${PRIVATE_BRANCH}."
@@ -459,6 +491,7 @@ jobs:
           SYNC_SCRIPT
           sudo chmod 755 /usr/local/bin/vps-sync
 
+          # Create vps-stop helper so user can end the session gracefully from inside SSH
           sudo tee /usr/local/bin/vps-stop >/dev/null <<'STOP_SCRIPT'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -469,6 +502,7 @@ jobs:
           STOP_SCRIPT
           sudo chmod 755 /usr/local/bin/vps-stop
 
+          # Ensure interactive SSH shells have ~/.local/bin, ~/.npm-global/bin, and ~/.bun/bin on PATH
           sudo tee /etc/profile.d/99-vps-paths.sh >/dev/null <<'EOF'
           export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
           EOF
@@ -478,6 +512,7 @@ jobs:
             echo '[ -f /etc/profile.d/99-vps-paths.sh ] && source /etc/profile.d/99-vps-paths.sh' >> /home/runner/.bashrc
           fi
 
+          # Restore state from the private repo now
           /usr/local/bin/vps-sync restore
 
       - name: Run Bootstrap Script (Reinstall Ephemeral Packages & AI CLI Tools)
@@ -486,8 +521,8 @@ jobs:
           set -euo pipefail
           if [ -f /home/runner/bootstrap.sh ]; then
             chmod +x /home/runner/bootstrap.sh
-            echo "Running /home/runner/bootstrap.sh as runner..."
-            su - runner -c "/home/runner/bootstrap.sh"
+            echo "Running /home/runner/bootstrap.sh as $(whoami)..."
+            /bin/bash -l /home/runner/bootstrap.sh
           else
             echo "No /home/runner/bootstrap.sh found, skipping."
           fi
@@ -499,6 +534,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Clamp session duration to at most 345 minutes so the final `if: always()` sync
+          # always has at least 10-15 minutes before GitHub's 360-minute hard job termination.
           MAX_MINUTES="${SESSION_MINUTES}"
           if [ "${MAX_MINUTES}" -gt 345 ]; then
             echo "Clamping session_minutes from ${MAX_MINUTES} to 345 to guarantee safe final sync before 6h limit."
@@ -509,6 +546,7 @@ jobs:
           SYNC_INTERVAL_SEC=$(( SYNC_INTERVAL_MINUTES * 60 ))
           LAST_SYNC=$(date +%s)
 
+          # Trap SIGTERM/SIGINT (e.g., when a user clicks "Cancel workflow" in GitHub UI)
           trap 'echo "Signal received! Exiting session loop to trigger final sync..."; exit 0' SIGTERM SIGINT
 
           echo "VPS session active until $(date -u -d "@${END_TIME}" +"%Y-%m-%d %H:%M:%S UTC") (${MAX_MINUTES} minutes)."
